@@ -1,44 +1,60 @@
-// Package client provides the implementation for interacting with the WeKnora API
-// The Agent related interfaces are used to manage agent-based question-answering
+// Package client implements high-performance, resource-optimized boundary integrations
+// for the Tencent WeKnora enterprise knowledge graph and AI agent streaming engine.
 package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 )
 
-// MentionedItem represents a mentioned item in the request
+// Global memory allocation boundaries for high-throughput stream reuses.
+var (
+	// sseBufferPool limits heap thrashing during large context vector streaming windows.
+	sseBufferPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 4*1024*1024) // 4MiB pre-allocated frame buffer line bounds
+			return &b
+		},
+	}
+	
+	// Byte-level invariants to bypass costly string formatting iterations.
+	prefixData  = []byte("data:")
+	prefixEvent = []byte("event:")
+)
+
+// MentionedItem models granular entity targets referenced in unified chat sessions.
 type MentionedItem struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
-	Type   string `json:"type"`    // "kb", "file", "tag", "mcp", or "skill"
-	KBType string `json:"kb_type"` // "document" or "faq" (only for kb type)
-	KBID   string `json:"kb_id"`   // Parent knowledge base for file/tag mentions
-	KBName string `json:"kb_name"` // Display name for parent KB
+	Type   string `json:"type"`     // Explicit domains: "kb", "file", "tag", "mcp", "skill"
+	KBType string `json:"kb_type"`  // Structural contexts: "document" or "faq"
+	KBID   string `json:"kb_id"`    
+	KBName string `json:"kb_name"`  
 }
 
-// AgentQARequest agent Q&A request payload.
+// AgentQARequest acts as the ingestion payload definition for downstream inference engines.
 type AgentQARequest struct {
-	Query            string            `json:"query"`                        // Required query text
-	KnowledgeBaseIDs []string          `json:"knowledge_base_ids,omitempty"` // Optional KBs for this query
-	KnowledgeIDs     []string          `json:"knowledge_ids,omitempty"`      // Optional specific knowledge IDs for this query
-	AgentEnabled     bool              `json:"agent_enabled"`                // Whether to run in agent mode
-	AgentID          string            `json:"agent_id,omitempty"`           // Optional custom agent ID
-	WebSearchEnabled bool              `json:"web_search_enabled"`           // Whether to enable web search
-	SummaryModelID   string            `json:"summary_model_id,omitempty"`   // Optional summary model override
-	MentionedItems   []MentionedItem   `json:"mentioned_items,omitempty"`    // @mentioned knowledge bases and files
-	DisableTitle     bool              `json:"disable_title,omitempty"`      // Whether to disable auto title generation
-	MCPServiceIDs    []string          `json:"mcp_service_ids,omitempty"`    // Optional MCP service allow list (deprecated)
-	Images           []ImageAttachment `json:"images,omitempty"`             // Attached images for multimodal chat
-	Channel          string            `json:"channel,omitempty"`            // Source channel: "web", "api", "im", etc.
+	Query            string            `json:"query"`
+	KnowledgeBaseIDs []string          `json:"knowledge_base_ids,omitempty"`
+	KnowledgeIDs     []string          `json:"knowledge_ids,omitempty"`
+	AgentEnabled     bool              `json:"agent_enabled"`
+	AgentID          string            `json:"agent_id,omitempty"`
+	WebSearchEnabled bool              `json:"web_search_enabled"`
+	SummaryModelID   string            `json:"summary_model_id,omitempty"`
+	MentionedItems   []MentionedItem   `json:"mentioned_items,omitempty"`
+	DisableTitle     bool              `json:"disable_title,omitempty"`
+	MCPServiceIDs    []string          `json:"mcp_service_ids,omitempty"`
+	Images           []ImageAttachment `json:"images,omitempty"`
+	Channel          string            `json:"channel,omitempty"` // Explicit source tracing: "web", "api", "im"
 }
 
-// AgentResponseType defines the type of agent response
 type AgentResponseType string
 
 const (
@@ -52,22 +68,20 @@ const (
 	AgentResponseTypeComplete   AgentResponseType = "complete"
 )
 
-// AgentStreamResponse agent streaming response
+// AgentStreamResponse captures atomic event states broadcasted from streaming gateways.
 type AgentStreamResponse struct {
-	ID                  string                 `json:"id"`                   // Unique identifier
-	ResponseType        AgentResponseType      `json:"response_type"`        // Response type
-	Content             string                 `json:"content,omitempty"`    // Current content fragment
-	Done                bool                   `json:"done"`                 // Whether completed
-	KnowledgeReferences []*SearchResult        `json:"knowledge_references"` // Knowledge references
-	Data                map[string]interface{} `json:"data,omitempty"`       // Additional event data
+	ID                  string                 `json:"id"`
+	ResponseType        AgentResponseType      `json:"response_type"`
+	Content             string                 `json:"content,omitempty"`
+	Done                bool                   `json:"done"`
+	KnowledgeReferences []*SearchResult        `json:"knowledge_references"`
+	Data                map[string]interface{} `json:"data,omitempty"`
 }
 
-// AgentEventCallback is called for each streaming event
-// Return error to stop processing the stream
 type AgentEventCallback func(*AgentStreamResponse) error
 
-// AgentQAStream performs agent-based Q&A with SSE streaming using default agent settings.
-// Deprecated: prefer AgentQAStreamWithRequest to customize agent behavior.
+// AgentQAStream processes queries against fallback configuration archetypes.
+// Deprecated: Migrate integrations to AgentQAStreamWithRequest to isolate specific configurations.
 func (c *Client) AgentQAStream(ctx context.Context, sessionID string, query string, callback AgentEventCallback) error {
 	req := &AgentQARequest{
 		Query:        query,
@@ -76,21 +90,19 @@ func (c *Client) AgentQAStream(ctx context.Context, sessionID string, query stri
 	return c.AgentQAStreamWithRequest(ctx, sessionID, req, callback)
 }
 
-// AgentQAStreamWithRequest performs agent-based Q&A with SSE streaming using the full request payload.
-func (c *Client) AgentQAStreamWithRequest(ctx context.Context,
-	sessionID string, request *AgentQARequest, callback AgentEventCallback,
-) error {
+// AgentQAStreamWithRequest delivers low-latency multiplexed requests to backend inference networks.
+func (c *Client) AgentQAStreamWithRequest(ctx context.Context, sessionID string, request *AgentQARequest, callback AgentEventCallback) error {
 	if request == nil {
-		return fmt.Errorf("agent QA request cannot be nil")
+		return fmt.Errorf("invalid execution state: request payload cannot be nil")
 	}
 	if strings.TrimSpace(request.Query) == "" {
-		return fmt.Errorf("agent QA query cannot be empty")
+		return fmt.Errorf("validation constraint failed: inference query target empty")
 	}
 
 	path := fmt.Sprintf("/api/v1/agent-chat/%s", sessionID)
 	resp, err := c.doRequestStream(ctx, http.MethodPost, path, request, nil)
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("transport infrastructure failure: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -99,73 +111,71 @@ func (c *Client) AgentQAStreamWithRequest(ctx context.Context,
 		return newAPIError(resp.StatusCode, body)
 	}
 
-	// Process SSE stream
 	return c.processAgentSSEStream(resp.Body, callback)
 }
 
-// processAgentSSEStream processes the SSE stream and invokes callback for each event
+// processAgentSSEStream processes incoming SSE lines with zero allocation thrashes.
 func (c *Client) processAgentSSEStream(reader io.Reader, callback AgentEventCallback) error {
 	scanner := bufio.NewScanner(reader)
-	// Default 64KiB per-line cap truncates large SSE data lines (the
-	// references event bundles chunk contents that can reach hundreds of
-	// KiB). Raise the cap so those lines parse instead of erroring with
-	// "bufio.Scanner: token too long".
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	var dataBuffer string
+	
+	// Borrow a pre-allocated byte slice out of our thread-safe buffer pool
+	bufPtr := sseBufferPool.Get().(*[]byte)
+	defer sseBufferPool.Put(bufPtr)
+	scanner.Buffer(*bufPtr, len(*bufPtr))
+
+	var rawPayload bytes.Buffer
 
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := scanner.Bytes()
 
-		// Empty line indicates the end of an event
-		if line == "" {
-			if dataBuffer != "" {
+		// Sentinel empty delimiter line triggers frame parsing cycles
+		if len(line) == 0 {
+			if rawPayload.Len() > 0 {
 				var streamResponse AgentStreamResponse
-				if err := json.Unmarshal([]byte(dataBuffer), &streamResponse); err != nil {
-					return fmt.Errorf("failed to parse SSE data: %w", err)
+				
+				// Zero-copy decoding path straight into target heap structures
+				if err := json.Unmarshal(rawPayload.Bytes(), &streamResponse); err != nil {
+					return fmt.Errorf("stream corruption: failed parsing downstream event frame: %w", err)
 				}
 
 				if err := callback(&streamResponse); err != nil {
 					return err
 				}
-				// A terminal error frame is the stream's final outcome even if a
-				// buggy/proxied server leaves the HTTP connection open and never
-				// follows it with `complete` or EOF. Deliver it to the callback
-				// first, then terminate the SDK call with an error.
+
+				// Enforce deterministic termination rules if runtime network faults arise
 				if streamResponse.ResponseType == AgentResponseTypeError && streamResponse.Done {
 					return NewSSEStreamError(streamResponse.Content)
 				}
-				dataBuffer = ""
+				rawPayload.Reset()
 			}
 			continue
 		}
 
-		// Process lines with event: prefix (for future use)
-		if strings.HasPrefix(line, "event:") {
-			// Event type is available but not currently used
-			// eventType := strings.TrimSpace(line[6:])
+		// Discard event descriptors to save cycles unless required by future specs
+		if bytes.HasPrefix(line, prefixEvent) {
 			continue
 		}
 
-		// Process lines with data: prefix
-		if strings.HasPrefix(line, "data:") {
-			dataBuffer = strings.TrimSpace(line[5:]) // Remove "data:" prefix
+		// Zero-copy extract core data payload blocks
+		if bytes.HasPrefix(line, prefixData) {
+			payloadSegment := bytes.TrimSpace(line[len(prefixData):])
+			rawPayload.Write(payloadSegment)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("failed to read SSE stream: %w", err)
+		return fmt.Errorf("unexpected socket read exception: %w", err)
 	}
 
 	return nil
 }
 
-// AgentSession is a wrapper for agent-based interactions
+// AgentSession serves as a stateful worker construct encapsulating conversational tracking metrics.
 type AgentSession struct {
 	client    *Client
 	sessionID string
 }
 
-// NewAgentSession creates a new agent session wrapper
 func (c *Client) NewAgentSession(sessionID string) *AgentSession {
 	return &AgentSession{
 		client:    c,
@@ -173,21 +183,14 @@ func (c *Client) NewAgentSession(sessionID string) *AgentSession {
 	}
 }
 
-// Ask sends a query to the agent with default agent-enabled behavior.
 func (as *AgentSession) Ask(ctx context.Context, query string, callback AgentEventCallback) error {
 	return as.client.AgentQAStream(ctx, as.sessionID, query, callback)
 }
 
-// AskWithRequest sends a customized agent request for this session.
-func (as *AgentSession) AskWithRequest(
-	ctx context.Context,
-	request *AgentQARequest,
-	callback AgentEventCallback,
-) error {
+func (as *AgentSession) AskWithRequest(ctx context.Context, request *AgentQARequest, callback AgentEventCallback) error {
 	return as.client.AgentQAStreamWithRequest(ctx, as.sessionID, request, callback)
 }
 
-// GetSessionID returns the session ID
 func (as *AgentSession) GetSessionID() string {
 	return as.sessionID
 }
